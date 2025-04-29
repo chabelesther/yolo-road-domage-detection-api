@@ -9,6 +9,7 @@ import logging
 import asyncio
 import time
 import os
+import sys
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,17 +26,108 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"greeting": "Hello, World!", "message": "Welcome to FastAPI!"}
+    # Affichons les informations sur les versions
+    import ultralytics
+    return {
+        "greeting": "Hello, World!",
+        "message": "Welcome to FastAPI!",
+        "ultralytics_version": ultralytics.__version__,
+        "python_version": sys.version,
+        "model_path": os.path.abspath("best.pt"),
+        "model_exists": os.path.exists("best.pt"),
+        "working_directory": os.getcwd()
+    }
 
 model = None
+
+@app.get("/model-info")
+async def model_info():
+    """Endpoint pour obtenir des informations sur le modèle et diagnostiquer les problèmes"""
+    model_path = "best.pt"
+    try:
+        # Informations sur le fichier
+        file_info = {}
+        if os.path.exists(model_path):
+            file_info["exists"] = True
+            file_info["size"] = os.path.getsize(model_path)
+            file_info["readable"] = os.access(model_path, os.R_OK)
+            file_info["path"] = os.path.abspath(model_path)
+        else:
+            file_info["exists"] = False
+            
+        # Informations environnement
+        import torch
+        import ultralytics
+        env_info = {
+            "python_version": sys.version,
+            "ultralytics_version": ultralytics.__version__,
+            "torch_version": torch.__version__,
+            "cuda_available": torch.cuda.is_available() if hasattr(torch, 'cuda') else False,
+            "working_directory": os.getcwd(),
+        }
+        
+        return {
+            "status": "ok",
+            "file_info": file_info,
+            "env_info": env_info
+        }
+    except Exception as e:
+        logger.error(f"Erreur lors de l'obtention des informations sur le modèle: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
 
 def get_model():
     global model
     if model is None:
         try:
+            # Vérifier si le fichier existe
+            model_path = "best.pt"
+            if not os.path.exists(model_path):
+                logger.error(f"Le fichier modèle {model_path} n'existe pas")
+                # Essayons de télécharger un modèle de secours
+                try:
+                    logger.info("Téléchargement d'un modèle par défaut...")
+                    model = YOLO("yolov8n.pt")  # Modèle par défaut à télécharger automatiquement
+                    logger.info("Modèle par défaut chargé avec succès")
+                    return model
+                except Exception as backup_error:
+                    logger.error(f"Échec du téléchargement du modèle par défaut: {str(backup_error)}")
+                    raise FileNotFoundError(f"Modèle non trouvé: {model_path}")
+            
+            # Vérifier les permissions
+            if not os.access(model_path, os.R_OK):
+                logger.error(f"Pas de permission de lecture pour {model_path}")
+                raise PermissionError(f"Impossible de lire le modèle: {model_path}")
+            
+            # Afficher la taille du fichier
+            file_size = os.path.getsize(model_path)
+            logger.info(f"Taille du fichier modèle: {file_size} bytes")
+            
+            # Essayer de charger le modèle avec gestion d'erreur détaillée
             logger.info("Chargement du modèle YOLO...")
-            model = YOLO("best.pt")
-            logger.info("Modèle YOLO chargé avec succès")
+            try:
+                model = YOLO(model_path)
+                logger.info("Modèle YOLO chargé avec succès")
+            except Exception as e:
+                logger.error(f"Erreur lors du chargement du modèle: {str(e)}")
+                
+                # Fichier probablement corrompu, tentons avec un modèle par défaut
+                try:
+                    logger.info("Tentative de chargement d'un modèle par défaut...")
+                    # Renommer le fichier corrompu pour le sauvegarder
+                    backup_path = f"{model_path}.backup"
+                    if os.path.exists(model_path):
+                        os.rename(model_path, backup_path)
+                        logger.info(f"Fichier corrompu sauvegardé en {backup_path}")
+                    
+                    # Charger un modèle par défaut
+                    model = YOLO("yolov8n.pt")  # Télécharge automatiquement
+                    logger.info("Modèle par défaut chargé avec succès")
+                except Exception as backup_error:
+                    logger.error(f"Échec du chargement du modèle par défaut: {str(backup_error)}")
+                    raise e
         except Exception as e:
             logger.error(f"Erreur lors du chargement du modèle: {str(e)}")
             raise e
