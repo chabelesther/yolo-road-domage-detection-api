@@ -25,10 +25,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Importer les fonctionnalités de video_avec_annotation
+try:
+    # Ajouter le répertoire 'others' au chemin de recherche des modules
+    others_path = os.path.join(os.getcwd(), "others")
+    if others_path not in sys.path:
+        sys.path.append(others_path)
+    
+    # Importer le router vidéo
+    from others.video_avec_annotation import router as video_router
+    
+    # Inclure le router dans notre application
+    app.include_router(video_router, tags=["Video Processing"])
+    
+    logger.info("Module de traitement vidéo chargé avec succès")
+except Exception as e:
+    logger.error(f"Erreur lors du chargement du module de traitement vidéo: {str(e)}")
+
 @app.get("/")
 async def root():
     # Affichons les informations sur les versions
     import ultralytics
+    
+    # Vérifier si le module vidéo est chargé
+    video_module_loaded = False
+    try:
+        from others.video_avec_annotation import router as video_router
+        video_module_loaded = True
+    except:
+        pass
+    
     return {
         "greeting": "Hello, World!",
         "message": "Welcome to FastAPI!",
@@ -36,7 +62,8 @@ async def root():
         "python_version": sys.version,
         "model_path": os.path.abspath("best.pt"),
         "model_exists": os.path.exists("best.pt"),
-        "working_directory": os.getcwd()
+        "working_directory": os.getcwd(),
+        "video_module": "Chargé" if video_module_loaded else "Non chargé"
     }
 
 model = None
@@ -83,62 +110,52 @@ def get_model():
     global model
     if model is None:
         try:
-            # Liste des chemins possibles où le modèle pourrait se trouver
-            possible_paths = [
-                "best.pt",                      # Chemin relatif simple
-                "./best.pt",                    # Chemin relatif explicite
-                "/app/best.pt",                 # Chemin absolu pour Docker
-                os.path.join(os.getcwd(), "best.pt"),  # Chemin absolu basé sur le répertoire courant
-                os.path.abspath("best.pt"),     # Chemin absolu normalisé
-                "../best.pt",                   # Un niveau au-dessus
-                "../../best.pt",                # Deux niveaux au-dessus
-                "/best.pt"                      # À la racine
-            ]
+            # Vérifier si le fichier existe
+            model_path = "best.pt"
+            if not os.path.exists(model_path):
+                logger.error(f"Le fichier modèle {model_path} n'existe pas")
+                # Essayons de télécharger un modèle de secours
+                try:
+                    logger.info("Téléchargement d'un modèle par défaut...")
+                    model = YOLO("yolov8n.pt")  # Modèle par défaut à télécharger automatiquement
+                    logger.info("Modèle par défaut chargé avec succès")
+                    return model
+                except Exception as backup_error:
+                    logger.error(f"Échec du téléchargement du modèle par défaut: {str(backup_error)}")
+                    raise FileNotFoundError(f"Modèle non trouvé: {model_path}")
             
-            # Rechercher si des fichiers .pt existent dans le système
-            all_pt_files = []
-            for root, dirs, files in os.walk(os.getcwd()):
-                for file in files:
-                    if file.endswith('.pt'):
-                        file_path = os.path.join(root, file)
-                        all_pt_files.append(file_path)
-                        # Ajouter aussi à la liste des chemins possibles
-                        possible_paths.append(file_path)
+            # Vérifier les permissions
+            if not os.access(model_path, os.R_OK):
+                logger.error(f"Pas de permission de lecture pour {model_path}")
+                raise PermissionError(f"Impossible de lire le modèle: {model_path}")
             
-            logger.info(f"Tous les fichiers .pt trouvés: {all_pt_files}")
+            # Afficher la taille du fichier
+            file_size = os.path.getsize(model_path)
+            logger.info(f"Taille du fichier modèle: {file_size} bytes")
             
-            # Essayer chaque chemin possible
-            for path in possible_paths:
-                logger.info(f"Tentative de chargement du modèle depuis: {path}")
-                if os.path.exists(path):
-                    try:
-                        file_size = os.path.getsize(path)
-                        logger.info(f"Fichier trouvé: {path}, taille: {file_size} bytes")
-                        
-                        # Vérifier les permissions
-                        if not os.access(path, os.R_OK):
-                            logger.warning(f"Pas de permission de lecture pour {path}")
-                            continue
-                        
-                        # Essayer de charger le modèle
-                        logger.info(f"Chargement du modèle depuis: {path}")
-                        model = YOLO(path)
-                        logger.info(f"Modèle chargé avec succès depuis: {path}")
-                        return model
-                    except Exception as e:
-                        logger.error(f"Erreur lors du chargement depuis {path}: {str(e)}")
-                        continue
-            
-            # Si on arrive ici, aucun modèle n'a pu être chargé
-            logger.warning("Aucun modèle n'a pu être chargé, recours au modèle par défaut")
+            # Essayer de charger le modèle avec gestion d'erreur détaillée
+            logger.info("Chargement du modèle YOLO...")
             try:
-                logger.info("Téléchargement d'un modèle par défaut...")
-                model = YOLO("yolov8n.pt")  # Modèle par défaut à télécharger automatiquement
-                logger.info("Modèle par défaut chargé avec succès")
-                return model
-            except Exception as backup_error:
-                logger.error(f"Échec du téléchargement du modèle par défaut: {str(backup_error)}")
-                raise Exception("Impossible de charger un modèle, même le modèle par défaut")
+                model = YOLO(model_path)
+                logger.info("Modèle YOLO chargé avec succès")
+            except Exception as e:
+                logger.error(f"Erreur lors du chargement du modèle: {str(e)}")
+                
+                # Fichier probablement corrompu, tentons avec un modèle par défaut
+                try:
+                    logger.info("Tentative de chargement d'un modèle par défaut...")
+                    # Renommer le fichier corrompu pour le sauvegarder
+                    backup_path = f"{model_path}.backup"
+                    if os.path.exists(model_path):
+                        os.rename(model_path, backup_path)
+                        logger.info(f"Fichier corrompu sauvegardé en {backup_path}")
+                    
+                    # Charger un modèle par défaut
+                    model = YOLO("yolov8n.pt")  # Télécharge automatiquement
+                    logger.info("Modèle par défaut chargé avec succès")
+                except Exception as backup_error:
+                    logger.error(f"Échec du chargement du modèle par défaut: {str(backup_error)}")
+                    raise e
         except Exception as e:
             logger.error(f"Erreur lors du chargement du modèle: {str(e)}")
             raise e
