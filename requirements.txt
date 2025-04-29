@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+hypercorn==0.14.4
 ultralytics
 opencv-python
 python-multipart
