@@ -10,6 +10,7 @@ import asyncio
 import time
 import os
 import sys
+import glob
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -82,52 +83,62 @@ def get_model():
     global model
     if model is None:
         try:
-            # Vérifier si le fichier existe
-            model_path = "best.pt"
-            if not os.path.exists(model_path):
-                logger.error(f"Le fichier modèle {model_path} n'existe pas")
-                # Essayons de télécharger un modèle de secours
-                try:
-                    logger.info("Téléchargement d'un modèle par défaut...")
-                    model = YOLO("yolov8n.pt")  # Modèle par défaut à télécharger automatiquement
-                    logger.info("Modèle par défaut chargé avec succès")
-                    return model
-                except Exception as backup_error:
-                    logger.error(f"Échec du téléchargement du modèle par défaut: {str(backup_error)}")
-                    raise FileNotFoundError(f"Modèle non trouvé: {model_path}")
+            # Liste des chemins possibles où le modèle pourrait se trouver
+            possible_paths = [
+                "best.pt",                      # Chemin relatif simple
+                "./best.pt",                    # Chemin relatif explicite
+                "/app/best.pt",                 # Chemin absolu pour Docker
+                os.path.join(os.getcwd(), "best.pt"),  # Chemin absolu basé sur le répertoire courant
+                os.path.abspath("best.pt"),     # Chemin absolu normalisé
+                "../best.pt",                   # Un niveau au-dessus
+                "../../best.pt",                # Deux niveaux au-dessus
+                "/best.pt"                      # À la racine
+            ]
             
-            # Vérifier les permissions
-            if not os.access(model_path, os.R_OK):
-                logger.error(f"Pas de permission de lecture pour {model_path}")
-                raise PermissionError(f"Impossible de lire le modèle: {model_path}")
+            # Rechercher si des fichiers .pt existent dans le système
+            all_pt_files = []
+            for root, dirs, files in os.walk(os.getcwd()):
+                for file in files:
+                    if file.endswith('.pt'):
+                        file_path = os.path.join(root, file)
+                        all_pt_files.append(file_path)
+                        # Ajouter aussi à la liste des chemins possibles
+                        possible_paths.append(file_path)
             
-            # Afficher la taille du fichier
-            file_size = os.path.getsize(model_path)
-            logger.info(f"Taille du fichier modèle: {file_size} bytes")
+            logger.info(f"Tous les fichiers .pt trouvés: {all_pt_files}")
             
-            # Essayer de charger le modèle avec gestion d'erreur détaillée
-            logger.info("Chargement du modèle YOLO...")
+            # Essayer chaque chemin possible
+            for path in possible_paths:
+                logger.info(f"Tentative de chargement du modèle depuis: {path}")
+                if os.path.exists(path):
+                    try:
+                        file_size = os.path.getsize(path)
+                        logger.info(f"Fichier trouvé: {path}, taille: {file_size} bytes")
+                        
+                        # Vérifier les permissions
+                        if not os.access(path, os.R_OK):
+                            logger.warning(f"Pas de permission de lecture pour {path}")
+                            continue
+                        
+                        # Essayer de charger le modèle
+                        logger.info(f"Chargement du modèle depuis: {path}")
+                        model = YOLO(path)
+                        logger.info(f"Modèle chargé avec succès depuis: {path}")
+                        return model
+                    except Exception as e:
+                        logger.error(f"Erreur lors du chargement depuis {path}: {str(e)}")
+                        continue
+            
+            # Si on arrive ici, aucun modèle n'a pu être chargé
+            logger.warning("Aucun modèle n'a pu être chargé, recours au modèle par défaut")
             try:
-                model = YOLO(model_path)
-                logger.info("Modèle YOLO chargé avec succès")
-            except Exception as e:
-                logger.error(f"Erreur lors du chargement du modèle: {str(e)}")
-                
-                # Fichier probablement corrompu, tentons avec un modèle par défaut
-                try:
-                    logger.info("Tentative de chargement d'un modèle par défaut...")
-                    # Renommer le fichier corrompu pour le sauvegarder
-                    backup_path = f"{model_path}.backup"
-                    if os.path.exists(model_path):
-                        os.rename(model_path, backup_path)
-                        logger.info(f"Fichier corrompu sauvegardé en {backup_path}")
-                    
-                    # Charger un modèle par défaut
-                    model = YOLO("yolov8n.pt")  # Télécharge automatiquement
-                    logger.info("Modèle par défaut chargé avec succès")
-                except Exception as backup_error:
-                    logger.error(f"Échec du chargement du modèle par défaut: {str(backup_error)}")
-                    raise e
+                logger.info("Téléchargement d'un modèle par défaut...")
+                model = YOLO("yolov8n.pt")  # Modèle par défaut à télécharger automatiquement
+                logger.info("Modèle par défaut chargé avec succès")
+                return model
+            except Exception as backup_error:
+                logger.error(f"Échec du téléchargement du modèle par défaut: {str(backup_error)}")
+                raise Exception("Impossible de charger un modèle, même le modèle par défaut")
         except Exception as e:
             logger.error(f"Erreur lors du chargement du modèle: {str(e)}")
             raise e
@@ -367,6 +378,103 @@ async def download_model():
         return JSONResponse(
             status_code=404,
             content={"success": False, "error": "Modèle non trouvé"}
+        )
+
+@app.get("/list-files")
+async def list_files():
+    """Liste tous les fichiers dans le répertoire de travail et les sous-répertoires"""
+    try:
+        # Répertoire courant
+        current_dir = os.getcwd()
+        logger.info(f"Répertoire de travail actuel: {current_dir}")
+        
+        # Liste des fichiers dans le répertoire courant
+        files_in_root = os.listdir(current_dir)
+        logger.info(f"Fichiers à la racine: {files_in_root}")
+        
+        # Recherche récursive des fichiers .pt
+        pt_files = []
+        for root, dirs, files in os.walk(current_dir):
+            for file in files:
+                if file.endswith('.pt'):
+                    full_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(full_path, current_dir)
+                    size = os.path.getsize(full_path)
+                    pt_files.append({
+                        "name": file,
+                        "path": rel_path,
+                        "full_path": full_path,
+                        "size": size,
+                        "readable": os.access(full_path, os.R_OK)
+                    })
+        
+        # Recherche de toutes les images dans le répertoire
+        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.gif']
+        image_files = []
+        for ext in image_extensions:
+            for file_path in glob.glob(f"{current_dir}/**/{ext}", recursive=True):
+                rel_path = os.path.relpath(file_path, current_dir)
+                image_files.append(rel_path)
+        
+        return {
+            "working_directory": current_dir,
+            "files_in_root": files_in_root,
+            "pt_files": pt_files,
+            "image_files": image_files[:20]  # Limiter à 20 images pour éviter une réponse trop grande
+        }
+    except Exception as e:
+        logger.error(f"Erreur lors du listage des fichiers: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+@app.get("/file-info/{file_path:path}")
+async def file_info(file_path: str):
+    """Obtenir des informations détaillées sur un fichier spécifique"""
+    try:
+        # Valider et normaliser le chemin
+        if '..' in file_path:  # Empêcher la traversée de répertoire
+            raise HTTPException(status_code=400, detail="Chemin non autorisé")
+            
+        full_path = os.path.join(os.getcwd(), file_path)
+        
+        if not os.path.exists(full_path):
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Fichier non trouvé: {file_path}"}
+            )
+            
+        # Collecter des informations sur le fichier
+        stat_info = os.stat(full_path)
+        file_info = {
+            "name": os.path.basename(full_path),
+            "path": file_path,
+            "full_path": full_path,
+            "size": stat_info.st_size,
+            "created": stat_info.st_ctime,
+            "modified": stat_info.st_mtime,
+            "readable": os.access(full_path, os.R_OK),
+            "writable": os.access(full_path, os.W_OK),
+            "executable": os.access(full_path, os.X_OK)
+        }
+        
+        # Si c'est un fichier .pt, essayer de charger pour tester
+        if full_path.endswith('.pt'):
+            try:
+                # Juste tester si le fichier peut être chargé
+                test_model = YOLO(full_path)
+                file_info["model_loadable"] = True
+            except Exception as e:
+                file_info["model_loadable"] = False
+                file_info["load_error"] = str(e)
+        
+        return file_info
+    except Exception as e:
+        logger.error(f"Erreur lors de l'obtention des informations sur le fichier: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
         )
 
 if __name__ == "__main__":
