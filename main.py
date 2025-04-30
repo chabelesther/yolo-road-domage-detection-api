@@ -84,7 +84,7 @@ def get_model():
     global model
     if model is None:
         try:
-            model = YOLO("best.pt")
+            model = YOLO("app/best.pt")
         except Exception as e:
             print(f"Erreur lors du chargement du modèle: {str(e)}")
             raise e
