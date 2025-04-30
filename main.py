@@ -84,10 +84,31 @@ def get_model():
     global model
     if model is None:
         try:
-            model = YOLO("/app/best.pt")
+            # Afficher le répertoire de travail pour comprendre où Python cherche
+            working_dir = os.getcwd()
+            logger.info(f"Répertoire de travail actuel: {working_dir}")
+            
+            # Utiliser le chemin relatif qui fonctionnait avant
+            logger.info("Tentative de chargement du modèle avec 'best.pt'...")
+            model = YOLO("best.pt")
+            logger.info("Modèle YOLO chargé avec succès")
         except Exception as e:
-            print(f"Erreur lors du chargement du modèle: {str(e)}")
-            raise e
+            logger.error(f"Erreur lors du chargement du modèle: {str(e)}")
+            
+            # Essayer avec le chemin absolu en cas d'échec
+            try:
+                logger.info("Tentative avec chemin absolu '/app/best.pt'...")
+                model = YOLO("/app/best.pt")
+                logger.info("Modèle chargé avec succès via chemin absolu")
+            except Exception as absolute_error:
+                # En dernier recours, essayer avec le modèle par défaut
+                try:
+                    logger.info("Tentative avec modèle par défaut 'yolov8n.pt'...")
+                    model = YOLO("yolov8n.pt")
+                    logger.info("Modèle par défaut chargé avec succès")
+                except Exception as default_error:
+                    logger.error("Échec de toutes les tentatives de chargement")
+                    raise e
     return model
 
 @app.post("/detect")
