@@ -25,36 +25,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Importer les fonctionnalités de video_avec_annotation
-try:
-    # Ajouter le répertoire 'others' au chemin de recherche des modules
-    others_path = os.path.join(os.getcwd(), "others")
-    if others_path not in sys.path:
-        sys.path.append(others_path)
-    
-    # Importer le router vidéo
-    from others.video_avec_annotation import router as video_router
-    
-    # Inclure le router dans notre application
-    app.include_router(video_router, tags=["Video Processing"])
-    
-    logger.info("Module de traitement vidéo chargé avec succès")
-except Exception as e:
-    logger.error(f"Erreur lors du chargement du module de traitement vidéo: {str(e)}")
-
 @app.get("/")
 async def root():
     # Affichons les informations sur les versions
     import ultralytics
-    
-    # Vérifier si le module vidéo est chargé
-    video_module_loaded = False
-    try:
-        from others.video_avec_annotation import router as video_router
-        video_module_loaded = True
-    except:
-        pass
-    
     return {
         "greeting": "Hello, World!",
         "message": "Welcome to FastAPI!",
@@ -62,8 +36,7 @@ async def root():
         "python_version": sys.version,
         "model_path": os.path.abspath("best.pt"),
         "model_exists": os.path.exists("best.pt"),
-        "working_directory": os.getcwd(),
-        "video_module": "Chargé" if video_module_loaded else "Non chargé"
+        "working_directory": os.getcwd()
     }
 
 model = None
@@ -106,58 +79,14 @@ async def model_info():
             content={"status": "error", "message": str(e)}
         )
 
+# Fonction pour charger le modèle à la demande
 def get_model():
     global model
     if model is None:
         try:
-            # Vérifier si le fichier existe
-            model_path = "best.pt"
-            if not os.path.exists(model_path):
-                logger.error(f"Le fichier modèle {model_path} n'existe pas")
-                # Essayons de télécharger un modèle de secours
-                try:
-                    logger.info("Téléchargement d'un modèle par défaut...")
-                    model = YOLO("yolov8n.pt")  # Modèle par défaut à télécharger automatiquement
-                    logger.info("Modèle par défaut chargé avec succès")
-                    return model
-                except Exception as backup_error:
-                    logger.error(f"Échec du téléchargement du modèle par défaut: {str(backup_error)}")
-                    raise FileNotFoundError(f"Modèle non trouvé: {model_path}")
-            
-            # Vérifier les permissions
-            if not os.access(model_path, os.R_OK):
-                logger.error(f"Pas de permission de lecture pour {model_path}")
-                raise PermissionError(f"Impossible de lire le modèle: {model_path}")
-            
-            # Afficher la taille du fichier
-            file_size = os.path.getsize(model_path)
-            logger.info(f"Taille du fichier modèle: {file_size} bytes")
-            
-            # Essayer de charger le modèle avec gestion d'erreur détaillée
-            logger.info("Chargement du modèle YOLO...")
-            try:
-                model = YOLO(model_path)
-                logger.info("Modèle YOLO chargé avec succès")
-            except Exception as e:
-                logger.error(f"Erreur lors du chargement du modèle: {str(e)}")
-                
-                # Fichier probablement corrompu, tentons avec un modèle par défaut
-                try:
-                    logger.info("Tentative de chargement d'un modèle par défaut...")
-                    # Renommer le fichier corrompu pour le sauvegarder
-                    backup_path = f"{model_path}.backup"
-                    if os.path.exists(model_path):
-                        os.rename(model_path, backup_path)
-                        logger.info(f"Fichier corrompu sauvegardé en {backup_path}")
-                    
-                    # Charger un modèle par défaut
-                    model = YOLO("yolov8n.pt")  # Télécharge automatiquement
-                    logger.info("Modèle par défaut chargé avec succès")
-                except Exception as backup_error:
-                    logger.error(f"Échec du chargement du modèle par défaut: {str(backup_error)}")
-                    raise e
+            model = YOLO("best.pt")
         except Exception as e:
-            logger.error(f"Erreur lors du chargement du modèle: {str(e)}")
+            print(f"Erreur lors du chargement du modèle: {str(e)}")
             raise e
     return model
 
@@ -324,79 +253,8 @@ async def stream_video(websocket: WebSocket):
         await websocket.close()
         logger.info(f"Connexion WebSocket fermée. Total frames traitées: {frames_processed}")
 
-@app.post("/upload-model")
-async def upload_model(model_file: UploadFile = File(...)):
-    """Endpoint pour télécharger un modèle personnalisé"""
-    global model
-    try:
-        # Vérifier le type de fichier
-        if not model_file.filename.endswith('.pt'):
-            raise HTTPException(status_code=400, detail="Le fichier doit être un modèle PyTorch (.pt)")
-        
-        # Sauvegarder le fichier
-        model_path = "best.pt"
-        
-        # Sauvegarder le modèle existant s'il y en a un
-        if os.path.exists(model_path):
-            backup_path = f"{model_path}.old"
-            os.rename(model_path, backup_path)
-            logger.info(f"Modèle existant sauvegardé en {backup_path}")
-        
-        # Écrire le nouveau fichier
-        contents = await model_file.read()
-        with open(model_path, "wb") as f:
-            f.write(contents)
-        
-        file_size = os.path.getsize(model_path)
-        logger.info(f"Modèle téléchargé: {model_file.filename}, taille: {file_size} bytes")
-        
-        # Réinitialiser le modèle pour qu'il soit rechargé
-        model = None
-        
-        # Tester le modèle
-        try:
-            test_model = YOLO(model_path)
-            model_info = {
-                "name": model_file.filename,
-                "size": file_size,
-                "path": os.path.abspath(model_path),
-                "test_load": "success"
-            }
-        except Exception as e:
-            logger.error(f"Erreur lors du test du modèle téléchargé: {str(e)}")
-            model_info = {
-                "name": model_file.filename,
-                "size": file_size,
-                "path": os.path.abspath(model_path),
-                "test_load": "failed",
-                "error": str(e)
-            }
-        
-        return {
-            "success": True,
-            "message": "Modèle téléchargé avec succès",
-            "model_info": model_info
-        }
-    
-    except Exception as e:
-        logger.error(f"Erreur lors du téléchargement du modèle: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": str(e)}
-        )
 
-@app.get("/download-model")
-async def download_model():
-    """Endpoint pour télécharger le modèle actuel"""
-    model_path = "best.pt"
-    if os.path.exists(model_path):
-        return FileResponse(path=model_path, filename="best.pt")
-    else:
-        return JSONResponse(
-            status_code=404,
-            content={"success": False, "error": "Modèle non trouvé"}
-        )
-
+ 
 @app.get("/list-files")
 async def list_files():
     """Liste tous les fichiers dans le répertoire de travail et les sous-répertoires"""
