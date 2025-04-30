@@ -1,6 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from ultralytics import YOLO
 import cv2
 import numpy as np
@@ -11,6 +11,9 @@ import time
 import os
 import sys
 import glob
+from io import BytesIO
+import tempfile
+import shutil
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,6 +27,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Fonction pour charger le modèle à la demande
+def get_model():
+    global model
+    if model is None:
+        try:
+            model = YOLO("best.pt")
+        except Exception as e:
+            print(f"Erreur lors du chargement du modèle: {str(e)}")
+            raise e
+    return model
 
 @app.get("/")
 async def root():
@@ -79,95 +92,110 @@ async def model_info():
             content={"status": "error", "message": str(e)}
         )
 
-# Fonction pour charger le modèle à la demande
-def get_model():
-    global model
-    if model is None:
-        try:
-            # Afficher le répertoire de travail pour comprendre où Python cherche
-            working_dir = os.getcwd()
-            logger.info(f"Répertoire de travail actuel: {working_dir}")
-            
-            # Utiliser le chemin relatif qui fonctionnait avant
-            logger.info("Tentative de chargement du modèle avec 'best.pt'...")
-            model = YOLO("best.pt")
-            logger.info("Modèle YOLO chargé avec succès")
-        except Exception as e:
-            logger.error(f"Erreur lors du chargement du modèle: {str(e)}")
-            
-            # Essayer avec le chemin absolu en cas d'échec
-            try:
-                logger.info("Tentative avec chemin absolu '/app/best.pt'...")
-                model = YOLO("/app/best.pt")
-                logger.info("Modèle chargé avec succès via chemin absolu")
-            except Exception as absolute_error:
-                # En dernier recours, essayer avec le modèle par défaut
-                try:
-                    logger.info("Tentative avec modèle par défaut 'yolov8n.pt'...")
-                    model = YOLO("yolov8n.pt")
-                    logger.info("Modèle par défaut chargé avec succès")
-                except Exception as default_error:
-                    logger.error("Échec de toutes les tentatives de chargement")
-                    raise e
-    return model
 
-@app.post("/detect")
-async def detect_image(image: UploadFile = File(...)):
-    """
-    Endpoint REST pour analyser une image et retourner l'image annotée.
-    """
-    start_time = time.time()
-    
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    # Obtenir le modèle
     try:
-        # Vérifier le type de fichier
-        if not image.content_type.startswith('image/'):
-            raise HTTPException(status_code=400, detail="Le fichier doit être une image")
-        
-        # Lire l'image
-        contents = await image.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if img is None:
-            raise HTTPException(status_code=400, detail="Impossible de décoder l'image")
-        
-        # Obtenir les dimensions de l'image
-        h, w = img.shape[:2]
-        logger.info(f"Image reçue: {w}x{h}px, taille: {len(contents)/1024:.1f}KB")
-        
-        # Conversion en RGB pour YOLO
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # Charger le modèle
         model = get_model()
-        
-        # Effectuer la prédiction
-        results = model.predict(img_rgb, verbose=False)
-        annotated_img = results[0].plot()
-        
-        # Convertir l'image annotée en base64
-        _, buffer = cv2.imencode('.jpg', annotated_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-        img_str = base64.b64encode(buffer).decode('utf-8')
-        
-        # Calculer le temps d'exécution
-        processing_time = time.time() - start_time
-        logger.info(f"Image traitée en {processing_time:.3f} secondes")
-        
-        # Retourner l'image annotée
-        return {
-            "success": True,
-            "image": img_str,
-            "processing_time": processing_time,
-            "detections": len(results[0].boxes)
-        }
-    
     except Exception as e:
-        logger.error(f"Erreur lors du traitement de l'image: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": str(e)}
-        )
+        raise HTTPException(status_code=500, detail=f"Erreur lors du chargement du modèle: {str(e)}")
+    
+    # Vérifier le type de fichier
+    content_type = file.content_type
+    if content_type not in ["image/jpeg", "image/png", "video/mp4"]:
+        raise HTTPException(status_code=400, detail="Type de fichier non pris en charge")
 
+    # Lire le fichier
+    contents = await file.read()
+
+    if content_type.startswith("image/"):
+        # Traitement d'image
+        from PIL import Image
+        image = Image.open(BytesIO(contents))
+        results = model.predict(image)
+        annotated_img = results[0].plot()
+        img_byte_array = BytesIO()
+        img = Image.fromarray(annotated_img)
+        img.save(img_byte_array, format="PNG")
+        img_byte_array.seek(0)
+        return StreamingResponse(img_byte_array, media_type="image/png")
+
+    elif content_type.startswith("video/"):
+        # Traitement de vidéo complète et renvoi de la vidéo annotée
+        input_file = None
+        output_file = None
+        
+        try:
+            # Créer des fichiers temporaires pour l'entrée et la sortie
+            input_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            input_file.write(contents)
+            input_file.close()
+            
+            # Créer un fichier temporaire pour la vidéo de sortie
+            output_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            output_file.close()
+            
+            # Ouvrir la vidéo avec OpenCV
+            cap = cv2.VideoCapture(input_file.name)
+            if not cap.isOpened():
+                raise HTTPException(status_code=500, detail="Impossible d'ouvrir la vidéo")
+            
+            # Obtenir les propriétés de la vidéo
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            
+            # Créer un objet VideoWriter pour la vidéo de sortie
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(output_file.name, fourcc, fps, (width, height))
+            
+            # Traiter et annoter chaque frame
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Convertir le frame pour YOLO et prédire
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = model.predict(frame_rgb, verbose=False)
+                
+                # Obtenir le frame annoté
+                annotated_frame = results[0].plot()
+                
+                # Convertir en BGR pour OpenCV
+                annotated_frame_bgr = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
+                
+                # Écrire le frame dans la vidéo de sortie
+                out.write(annotated_frame_bgr)
+            
+            # Libérer les ressources
+            cap.release()
+            out.release()
+            
+            # Créer une copie temporaire persistante pour FileResponse
+            response_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            response_file.close()
+            
+            # Copier le fichier de sortie vers le fichier de réponse
+            shutil.copy2(output_file.name, response_file.name)
+            
+            # Retourner la vidéo annotée
+            return FileResponse(
+                path=response_file.name,
+                media_type="video/mp4",
+                filename="video_annotated.mp4"
+            )
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Erreur lors du traitement de la vidéo: {str(e)}")
+        finally:
+            # Nettoyer les fichiers temporaires
+            if input_file and os.path.exists(input_file.name):
+                os.unlink(input_file.name)
+            if output_file and os.path.exists(output_file.name):
+                os.unlink(output_file.name)
+            # Ne pas supprimer response_file car il est utilisé par FileResponse
 @app.websocket("/ws/stream-video")
 async def stream_video(websocket: WebSocket):
     await websocket.accept()
