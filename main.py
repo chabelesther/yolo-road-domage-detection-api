@@ -10,15 +10,19 @@ import asyncio
 import time
 import os
 import sys
-import glob
-from io import BytesIO
-import tempfile
-import shutil
+import threading
+import signal
+import uvicorn
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# Gestion des événements de shutdown
+should_exit = False
+active_connections = set()
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,15 +31,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Variable globale pour le modèle
+model = None
+model_lock = threading.Lock()
+
 # Fonction pour charger le modèle à la demande
 def get_model():
     global model
-    if model is None:
-        try:
-            model = YOLO("best.pt")
-        except Exception as e:
-            print(f"Erreur lors du chargement du modèle: {str(e)}")
-            raise e
+    with model_lock:
+        if model is None:
+            try:
+                model = YOLO("best.pt")
+            except Exception as e:
+                print(f"Erreur lors du chargement du modèle: {str(e)}")
+                raise e
     return model
 
 @app.get("/")
@@ -52,171 +62,103 @@ async def root():
         "working_directory": os.getcwd()
     }
 
-model = None
-
-@app.get("/model-info")
-async def model_info():
-    """Endpoint pour obtenir des informations sur le modèle et diagnostiquer les problèmes"""
-    model_path = "best.pt"
+# Précharger le modèle au démarrage pour éviter la latence du premier appel
+@app.on_event("startup")
+async def startup_event():
     try:
-        # Informations sur le fichier
-        file_info = {}
-        if os.path.exists(model_path):
-            file_info["exists"] = True
-            file_info["size"] = os.path.getsize(model_path)
-            file_info["readable"] = os.access(model_path, os.R_OK)
-            file_info["path"] = os.path.abspath(model_path)
-        else:
-            file_info["exists"] = False
-            
-        # Informations environnement
-        import torch
-        import ultralytics
-        env_info = {
-            "python_version": sys.version,
-            "ultralytics_version": ultralytics.__version__,
-            "torch_version": torch.__version__,
-            "cuda_available": torch.cuda.is_available() if hasattr(torch, 'cuda') else False,
-            "working_directory": os.getcwd(),
-        }
-        
-        return {
-            "status": "ok",
-            "file_info": file_info,
-            "env_info": env_info
-        }
+        get_model()
+        logger.info("Modèle YOLO préchargé avec succès")
     except Exception as e:
-        logger.error(f"Erreur lors de l'obtention des informations sur le modèle: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)}
-        )
+        logger.error(f"Erreur lors du préchargement du modèle: {str(e)}")
 
-
-@app.post("/predict")
-async def predict(file: UploadFile = File(...)):
-    # Obtenir le modèle
-    try:
-        model = get_model()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur lors du chargement du modèle: {str(e)}")
+# Gestionnaire d'arrêt du serveur
+@app.on_event("shutdown")
+async def shutdown_event():
+    global should_exit, active_connections
     
-    # Vérifier le type de fichier
-    content_type = file.content_type
-    if content_type not in ["image/jpeg", "image/png", "video/mp4"]:
-        raise HTTPException(status_code=400, detail="Type de fichier non pris en charge")
-
-    # Lire le fichier
-    contents = await file.read()
-
-    if content_type.startswith("image/"):
-        # Traitement d'image
-        from PIL import Image
-        image = Image.open(BytesIO(contents))
-        results = model.predict(image)
-        annotated_img = results[0].plot()
-        img_byte_array = BytesIO()
-        img = Image.fromarray(annotated_img)
-        img.save(img_byte_array, format="PNG")
-        img_byte_array.seek(0)
-        return StreamingResponse(img_byte_array, media_type="image/png")
-
-    elif content_type.startswith("video/"):
-        # Traitement de vidéo complète et renvoi de la vidéo annotée
-        input_file = None
-        output_file = None
-        
+    logger.info("Arrêt du serveur en cours...")
+    should_exit = True
+    
+    # Fermer toutes les connexions WebSocket actives
+    for ws in active_connections.copy():
         try:
-            # Créer des fichiers temporaires pour l'entrée et la sortie
-            input_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            input_file.write(contents)
-            input_file.close()
-            
-            # Créer un fichier temporaire pour la vidéo de sortie
-            output_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            output_file.close()
-            
-            # Ouvrir la vidéo avec OpenCV
-            cap = cv2.VideoCapture(input_file.name)
-            if not cap.isOpened():
-                raise HTTPException(status_code=500, detail="Impossible d'ouvrir la vidéo")
-            
-            # Obtenir les propriétés de la vidéo
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            
-            # Créer un objet VideoWriter pour la vidéo de sortie
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_file.name, fourcc, fps, (width, height))
-            
-            # Traiter et annoter chaque frame
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                # Convertir le frame pour YOLO et prédire
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = model.predict(frame_rgb, verbose=False)
-                
-                # Obtenir le frame annoté
-                annotated_frame = results[0].plot()
-                
-                # Convertir en BGR pour OpenCV
-                annotated_frame_bgr = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
-                
-                # Écrire le frame dans la vidéo de sortie
-                out.write(annotated_frame_bgr)
-            
-            # Libérer les ressources
-            cap.release()
-            out.release()
-            
-            # Créer une copie temporaire persistante pour FileResponse
-            response_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            response_file.close()
-            
-            # Copier le fichier de sortie vers le fichier de réponse
-            shutil.copy2(output_file.name, response_file.name)
-            
-            # Retourner la vidéo annotée
-            return FileResponse(
-                path=response_file.name,
-                media_type="video/mp4",
-                filename="video_annotated.mp4"
-            )
-            
+            await ws.close(code=1000, reason="Arrêt du serveur")
+            logger.info(f"WebSocket fermé: {id(ws)}")
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Erreur lors du traitement de la vidéo: {str(e)}")
-        finally:
-            # Nettoyer les fichiers temporaires
-            if input_file and os.path.exists(input_file.name):
-                os.unlink(input_file.name)
-            if output_file and os.path.exists(output_file.name):
-                os.unlink(output_file.name)
-            # Ne pas supprimer response_file car il est utilisé par FileResponse
+            logger.error(f"Erreur lors de la fermeture du WebSocket: {str(e)}")
+    
+    logger.info("Fermeture des ressources terminée")
+
+# Ajout d'un endpoint pour arrêter le serveur
+@app.get("/shutdown")
+async def shutdown_server():
+    logger.info("Demande d'arrêt du serveur reçue via endpoint")
+    # Programmer l'arrêt dans un thread séparé pour avoir le temps de répondre à la requête
+    def stop_server():
+        time.sleep(1)  # Attendre que la réponse soit envoyée
+        os.kill(os.getpid(), signal.SIGINT)
+    
+    threading.Thread(target=stop_server).start()
+    return {"message": "Arrêt du serveur en cours"}
+    
 @app.websocket("/ws/stream-video")
 async def stream_video(websocket: WebSocket):
     await websocket.accept()
     frames_processed = 0
     timeout_count = 0
     last_frame_time = time.time()
+    skip_frames = 0
+    
+    # Ajouter la connexion à l'ensemble des connexions actives
+    active_connections.add(websocket)
     
     try:
         model = get_model()
-        logger.info("Connexion WebSocket établie pour le streaming vidéo")
+        logger.info(f"Connexion WebSocket établie pour le streaming vidéo (ID: {id(websocket)})")
         await websocket.send_json({"status": "ready"})
 
-        while True:
-            # Réception des chunks vidéo avec timeout plus long
+        while not should_exit:
+            # Réception des chunks vidéo avec timeout
             try:
-                data = await asyncio.wait_for(websocket.receive_bytes(), timeout=10.0)
-                timeout_count = 0  # Réinitialiser le compteur de timeouts
+                # Recevoir les données ou un message JSON
+                try:
+                    data = await asyncio.wait_for(websocket.receive(), timeout=5.0)
+                    timeout_count = 0  # Réinitialiser le compteur de timeouts
+                    
+                    # Vérifier si c'est un message JSON de contrôle
+                    if "text" in data:
+                        try:
+                            msg = json.loads(data["text"])
+                            if "action" in msg and msg["action"] == "disconnect":
+                                logger.info(f"Client a demandé de se déconnecter (ID: {id(websocket)})")
+                                break
+                            elif "pong" in msg:
+                                # Réponse à notre ping, rien à faire
+                                continue
+                        except:
+                            # Ignorer les erreurs de parsing JSON
+                            pass
+                        continue
+                    
+                    # Sinon, c'est un binaire d'image
+                    if "bytes" not in data:
+                        continue
+                    
+                    data = data["bytes"]
+                except asyncio.TimeoutError:
+                    timeout_count += 1
+                    logger.warning(f"Timeout #{timeout_count} lors de la réception")
+                    try:
+                        await websocket.send_json({"ping": time.time()})
+                    except:
+                        logger.error("Impossible d'envoyer le ping, connexion probablement fermée")
+                        break
+                    if timeout_count > 3:
+                        logger.error("Trop de timeouts consécutifs, fermeture de la connexion")
+                        break
+                    continue
                 
-                # Log détaillé de la réception
                 data_size = len(data) if data else 0
-                logger.info(f"Données reçues: {data_size} bytes")
                 
                 if not data or data_size < 1000:
                     logger.warning(f"Données insuffisantes reçues: {data_size} bytes")
@@ -226,35 +168,49 @@ async def stream_video(websocket: WebSocket):
                 nparr = np.frombuffer(data, np.uint8)
                 
                 # Vérifier si c'est une image JPEG valide
-                if nparr[0] == 0xFF and nparr[1] == 0xD8:
-                    logger.debug("Format JPEG détecté")
-                else:
+                if nparr[0] != 0xFF or nparr[1] != 0xD8:
                     logger.warning("Format non-JPEG détecté, tentative de décodage quand même")
                 
                 # Décodage de l'image
                 frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 if frame is None:
                     logger.warning("Échec du décodage de l'image")
-                    # Envoi d'un message d'erreur au client
                     await websocket.send_json({"error": "Échec du décodage de l'image"})
                     continue
                 
-                # Log des dimensions pour debug
-                h, w = frame.shape[:2]
-                logger.info(f"Image décodée: {w}x{h}px")
+                # Contrôle adaptatif du débit en fonction du temps de traitement
+                current_time = time.time()
+                processing_time = current_time - last_frame_time
+                
+                # Si le traitement est trop lent, on saute des images
+                if processing_time < 0.05:  # Temps de traitement très rapide
+                    skip_frames = 0
+                elif processing_time > 0.2:  # Traitement lent
+                    skip_frames = min(skip_frames + 1, 2)  # Augmenter progressivement, max 2
+                
+                if skip_frames > 0 and frames_processed % (skip_frames + 1) != 0:
+                    # On saute cette frame pour réduire la charge
+                    frames_processed += 1
+                    continue
+                
+                # Récupérer les dimensions originales
+                original_height, original_width = frame.shape[:2]
                 
                 # Conversion en RGB pour YOLO
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 
-                # Prédiction YOLO
-                results = model.predict(frame_rgb, verbose=False)
+                # Prédiction YOLO avec conf plus élevée pour moins de détections
+                results = model.predict(frame_rgb, conf=0.45, verbose=False)
+                
+                # Obtenir le résultat annoté mais conserver les dimensions originales
                 annotated_frame = results[0].plot()
                 
-                # Compression et envoi
-                _, buffer_jpeg = cv2.imencode(".jpg", annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+                # Compression et envoi avec qualité adaptée pour réduire la latence
+                # Qualité plus faible pour améliorer la latence tout en conservant les dimensions
+                _, buffer_jpeg = cv2.imencode(".jpg", annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
                 frame_base64 = base64.b64encode(buffer_jpeg).decode("utf-8")
                 
-                # Calculer le temps écoulé depuis la dernière frame
+                # Calculer FPS
                 current_time = time.time()
                 fps = 1.0 / (current_time - last_frame_time) if current_time > last_frame_time else 0
                 last_frame_time = current_time
@@ -263,27 +219,15 @@ async def stream_video(websocket: WebSocket):
                 await websocket.send_json({
                     "frame": frame_base64,
                     "timestamp": current_time,
-                    "fps": round(fps, 1)
+                    "fps": round(fps, 1),
+                    "dimensions": {"width": original_width, "height": original_height},
+                    "status": "ok"
                 })
                 
                 frames_processed += 1
-                if frames_processed % 5 == 0:
-                    logger.info(f"Frame #{frames_processed} traitée et envoyée, FPS: {round(fps, 1)}")
+                if frames_processed % 10 == 0:
+                    logger.info(f"Frame #{frames_processed} traitée, FPS: {round(fps, 1)}, Skip: {skip_frames}")
                 
-            except asyncio.TimeoutError:
-                timeout_count += 1
-                logger.warning(f"Timeout #{timeout_count} lors de la réception")
-                # Envoyer un ping pour maintenir la connexion
-                try:
-                    await websocket.send_json({"ping": time.time()})
-                except:
-                    logger.error("Impossible d'envoyer le ping, connexion probablement fermée")
-                    break
-                # Si trop de timeouts consécutifs, on considère la connexion comme perdue
-                if timeout_count > 5:
-                    logger.error("Trop de timeouts consécutifs, fermeture de la connexion")
-                    break
-                continue
             except Exception as e:
                 logger.error(f"Erreur lors de la réception: {str(e)}")
                 if "connection closed" in str(e).lower():
@@ -291,7 +235,7 @@ async def stream_video(websocket: WebSocket):
                 continue
 
     except WebSocketDisconnect:
-        logger.info("Client déconnecté")
+        logger.info(f"Client déconnecté (ID: {id(websocket)})")
     except Exception as e:
         logger.error(f"Erreur serveur: {str(e)}")
         try:
@@ -299,116 +243,49 @@ async def stream_video(websocket: WebSocket):
         except:
             pass
     finally:
-        await websocket.close()
+        # Supprimer la connexion de l'ensemble des connexions actives
+        if websocket in active_connections:
+            active_connections.remove(websocket)
+        
+        try:
+            await websocket.close()
+        except:
+            pass
+        
         logger.info(f"Connexion WebSocket fermée. Total frames traitées: {frames_processed}")
 
-
- 
-@app.get("/list-files")
-async def list_files():
-    """Liste tous les fichiers dans le répertoire de travail et les sous-répertoires"""
-    try:
-        # Répertoire courant
-        current_dir = os.getcwd()
-        logger.info(f"Répertoire de travail actuel: {current_dir}")
-        
-        # Liste des fichiers dans le répertoire courant
-        files_in_root = os.listdir(current_dir)
-        logger.info(f"Fichiers à la racine: {files_in_root}")
-        
-        # Recherche récursive des fichiers .pt
-        pt_files = []
-        for root, dirs, files in os.walk(current_dir):
-            for file in files:
-                if file.endswith('.pt'):
-                    full_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(full_path, current_dir)
-                    size = os.path.getsize(full_path)
-                    pt_files.append({
-                        "name": file,
-                        "path": rel_path,
-                        "full_path": full_path,
-                        "size": size,
-                        "readable": os.access(full_path, os.R_OK)
-                    })
-        
-        # Recherche de toutes les images dans le répertoire
-        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.gif']
-        image_files = []
-        for ext in image_extensions:
-            for file_path in glob.glob(f"{current_dir}/**/{ext}", recursive=True):
-                rel_path = os.path.relpath(file_path, current_dir)
-                image_files.append(rel_path)
-        
-        return {
-            "working_directory": current_dir,
-            "files_in_root": files_in_root,
-            "pt_files": pt_files,
-            "image_files": image_files[:20]  # Limiter à 20 images pour éviter une réponse trop grande
-        }
-    except Exception as e:
-        logger.error(f"Erreur lors du listage des fichiers: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
-
-@app.get("/file-info/{file_path:path}")
-async def file_info(file_path: str):
-    """Obtenir des informations détaillées sur un fichier spécifique"""
-    try:
-        # Valider et normaliser le chemin
-        if '..' in file_path:  # Empêcher la traversée de répertoire
-            raise HTTPException(status_code=400, detail="Chemin non autorisé")
-            
-        full_path = os.path.join(os.getcwd(), file_path)
-        
-        if not os.path.exists(full_path):
-            return JSONResponse(
-                status_code=404,
-                content={"error": f"Fichier non trouvé: {file_path}"}
-            )
-            
-        # Collecter des informations sur le fichier
-        stat_info = os.stat(full_path)
-        file_info = {
-            "name": os.path.basename(full_path),
-            "path": file_path,
-            "full_path": full_path,
-            "size": stat_info.st_size,
-            "created": stat_info.st_ctime,
-            "modified": stat_info.st_mtime,
-            "readable": os.access(full_path, os.R_OK),
-            "writable": os.access(full_path, os.W_OK),
-            "executable": os.access(full_path, os.X_OK)
-        }
-        
-        # Si c'est un fichier .pt, essayer de charger pour tester
-        if full_path.endswith('.pt'):
-            try:
-                # Juste tester si le fichier peut être chargé
-                test_model = YOLO(full_path)
-                file_info["model_loadable"] = True
-            except Exception as e:
-                file_info["model_loadable"] = False
-                file_info["load_error"] = str(e)
-        
-        return file_info
-    except Exception as e:
-        logger.error(f"Erreur lors de l'obtention des informations sur le fichier: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
+# Gestionnaire de signaux pour arrêter proprement le serveur
+def signal_handler(sig, frame):
+    logger.info(f"Signal {sig} reçu, arrêt du serveur...")
+    os._exit(0)  # Sortie forcée mais propre
 
 if __name__ == "__main__":
-    import uvicorn
-    
     # Récupérer le port depuis les variables d'environnement, avec une valeur par défaut
     port = int(os.environ.get("PORT", 8000))
+    
+    # Enregistrer les gestionnaires de signaux
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     # Log de démarrage
     logger.info(f"Démarrage du serveur sur le port {port}")
     
-    # Démarrer le serveur
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # Configuration avancée d'Uvicorn
+    config = uvicorn.Config(
+        app=app, 
+        host="0.0.0.0", 
+        port=port,
+        workers=1,
+        loop="asyncio",
+        log_level="info",
+        timeout_keep_alive=60,  # Réduire le timeout pour libérer les ressources plus rapidement
+        access_log=False  # Désactiver les logs d'accès pour améliorer les performances
+    )
+    
+    server = uvicorn.Server(config)
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        logger.info("Arrêt du serveur par interruption clavier")
+    finally:
+        logger.info("Serveur arrêté")
