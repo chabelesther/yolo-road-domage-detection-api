@@ -15,19 +15,56 @@ import signal
 import uvicorn
 import json
 import requests
+from contextlib import asynccontextmanager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-app = FastAPI()
 
 # Gestion des événements de shutdown
 should_exit = False
 active_connections = set()
 
+# Gestionnaire de cycle de vie avec le nouveau système Lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Code exécuté au démarrage
+    try:
+        # Préchargement du modèle
+        get_model()
+        logger.info("Modèle YOLO préchargé avec succès")
+    except Exception as e:
+        logger.error(f"Erreur lors du préchargement du modèle: {str(e)}")
+    
+    yield  # Cette ligne marque la séparation entre le code de démarrage et d'arrêt
+    
+    # Code exécuté à l'arrêt
+    global should_exit, active_connections
+    logger.info("Arrêt du serveur en cours...")
+    should_exit = True
+    
+    # Fermer toutes les connexions WebSocket actives
+    for ws in active_connections.copy():
+        try:
+            await ws.close(code=1000, reason="Arrêt du serveur")
+            logger.info(f"WebSocket fermé: {id(ws)}")
+        except Exception as e:
+            logger.error(f"Erreur lors de la fermeture du WebSocket: {str(e)}")
+    
+    logger.info("Fermeture des ressources terminée")
+
+# Initialisation de l'application avec le gestionnaire de cycle de vie
+app = FastAPI(lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "*",
+        "https://your-frontend-domain.com",  # Remplacez par votre domaine frontend réel
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000", 
+        "http://127.0.0.1:5173"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -54,7 +91,7 @@ def get_model():
                 
                 # Télécharger le modèle si nécessaire
                 if not os.path.exists(model_path):
-                    model_url = "https://ipnwvgwgra.ufs.sh/f/ZyPUyRA61o3xpv7xCHEXJibo41kTlesu3M0hKUO2Y7Gtf9ZS"
+                    model_url = os.environ.get("MODEL_URL", "https://ipnwvgwgra.ufs.sh/f/ZyPUyRA61o3xpv7xCHEXJibo41kTlesu3M0hKUO2Y7Gtf9ZS")
                     if model_url:
                         logger.info(f"Téléchargement du modèle depuis {model_url}")
                         try:
@@ -118,34 +155,6 @@ async def root():
         "working_directory": os.getcwd()
     }
 
-# Précharger le modèle au démarrage pour éviter la latence du premier appel
-@app.on_event("startup")
-async def startup_event():
-    try:
-        get_model()
-        logger.info("Modèle YOLO préchargé avec succès")
-    except Exception as e:
-        logger.error(f"Erreur lors du préchargement du modèle: {str(e)}")
-
-# Gestionnaire d'arrêt du serveur
-@app.on_event("shutdown")
-async def shutdown_event():
-    global should_exit, active_connections
-    
-    logger.info("Arrêt du serveur en cours...")
-    should_exit = True
-    
-    # Fermer toutes les connexions WebSocket actives
-    for ws in active_connections.copy():
-        try:
-            await ws.close(code=1000, reason="Arrêt du serveur")
-            logger.info(f"WebSocket fermé: {id(ws)}")
-        except Exception as e:
-            logger.error(f"Erreur lors de la fermeture du WebSocket: {str(e)}")
-    
-    logger.info("Fermeture des ressources terminée")
-
-# Ajout d'un endpoint pour arrêter le serveur
 @app.get("/shutdown")
 async def shutdown_server():
     logger.info("Demande d'arrêt du serveur reçue via endpoint")
@@ -164,6 +173,8 @@ async def stream_video(websocket: WebSocket):
     timeout_count = 0
     last_frame_time = time.time()
     skip_frames = 0
+    last_ping_time = time.time()
+    ping_interval = 30  # Envoyer un ping toutes les 30 secondes
     
     # Ajouter la connexion à l'ensemble des connexions actives
     active_connections.add(websocket)
@@ -174,11 +185,22 @@ async def stream_video(websocket: WebSocket):
         await websocket.send_json({"status": "ready"})
 
         while not should_exit:
+            # Vérifier si un ping est nécessaire pour maintenir la connexion active
+            current_time = time.time()
+            if current_time - last_ping_time > ping_interval:
+                try:
+                    await websocket.send_json({"ping": current_time})
+                    last_ping_time = current_time
+                    logger.debug("Ping envoyé pour maintenir la connexion")
+                except:
+                    logger.warning("Erreur lors de l'envoi du ping, connexion probablement fermée")
+                    break
+                    
             # Réception des chunks vidéo avec timeout
             try:
                 # Recevoir les données ou un message JSON
                 try:
-                    data = await asyncio.wait_for(websocket.receive(), timeout=5.0)
+                    data = await asyncio.wait_for(websocket.receive(), timeout=10.0)  # Augmentation du timeout
                     timeout_count = 0  # Réinitialiser le compteur de timeouts
                     
                     # Vérifier si c'est un message JSON de contrôle
@@ -206,10 +228,11 @@ async def stream_video(websocket: WebSocket):
                     logger.warning(f"Timeout #{timeout_count} lors de la réception")
                     try:
                         await websocket.send_json({"ping": time.time()})
+                        last_ping_time = time.time()
                     except:
                         logger.error("Impossible d'envoyer le ping, connexion probablement fermée")
                         break
-                    if timeout_count > 3:
+                    if timeout_count > 5:  # Augmenter la tolérance aux timeouts
                         logger.error("Trop de timeouts consécutifs, fermeture de la connexion")
                         break
                     continue
@@ -426,7 +449,7 @@ if __name__ == "__main__":
         workers=1,
         loop="asyncio",
         log_level="info",
-        timeout_keep_alive=60,  # Réduire le timeout pour libérer les ressources plus rapidement
+        timeout_keep_alive=120,  # Augmentation du timeout pour les connexions persistantes
         access_log=False  # Désactiver les logs d'accès pour améliorer les performances
     )
     
