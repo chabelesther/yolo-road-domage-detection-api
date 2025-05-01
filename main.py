@@ -61,7 +61,8 @@ app.add_middleware(
         "*",
         "https://your-frontend-domain.com",  # Remplacez par votre domaine frontend réel
         "http://localhost:3000",
-        "http://localhost:5173",
+        "http://localhost:3001",
+        
         "http://127.0.0.1:3000", 
         "http://127.0.0.1:5173"
     ],
