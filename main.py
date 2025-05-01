@@ -14,6 +14,7 @@ import threading
 import signal
 import uvicorn
 import json
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,9 +43,29 @@ def get_model():
     with model_lock:
         if model is None:
             try:
-                model = YOLO("best.pt")
+                # Vérifie si le modèle existe, sinon essaie de le télécharger depuis une URL
+                model_path = "best.pt"
+                if not os.path.exists(model_path):
+                    model_url = os.environ.get("MODEL_URL", None)
+                    if model_url:
+                        logger.info(f"Téléchargement du modèle depuis {model_url}")
+                        response = requests.get(model_url, stream=True)
+                        if response.status_code == 200:
+                            with open(model_path, 'wb') as f:
+                                for chunk in response.iter_content(chunk_size=8192):
+                                    f.write(chunk)
+                            logger.info("Modèle téléchargé avec succès")
+                        else:
+                            logger.error(f"Échec du téléchargement du modèle: {response.status_code}")
+                    else:
+                        logger.warning("MODEL_URL non défini, impossible de télécharger le modèle")
+                
+                if os.path.exists(model_path):
+                    model = YOLO(model_path)
+                else:
+                    raise FileNotFoundError(f"Le modèle {model_path} n'existe pas et n'a pas pu être téléchargé")
             except Exception as e:
-                print(f"Erreur lors du chargement du modèle: {str(e)}")
+                logger.error(f"Erreur lors du chargement du modèle: {str(e)}")
                 raise e
     return model
 
