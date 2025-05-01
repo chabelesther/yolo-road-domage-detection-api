@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from ultralytics import YOLO
@@ -45,23 +45,58 @@ def get_model():
             try:
                 # Vérifie si le modèle existe, sinon essaie de le télécharger depuis une URL
                 model_path = "best.pt"
+                model_min_size = 20 * 1024 * 1024  # Taille minimale attendue (20 Mo)
+                
+                # Si le fichier existe mais est trop petit, le supprimer
+                if os.path.exists(model_path) and os.path.getsize(model_path) < model_min_size:
+                    logger.warning(f"Modèle existant trop petit: {os.path.getsize(model_path)} octets, suppression...")
+                    os.remove(model_path)
+                
+                # Télécharger le modèle si nécessaire
                 if not os.path.exists(model_path):
-                    model_url = os.environ.get("MODEL_URL", None)
+                    model_url = "https://ipnwvgwgra.ufs.sh/f/ZyPUyRA61o3xpv7xCHEXJibo41kTlesu3M0hKUO2Y7Gtf9ZS"
                     if model_url:
                         logger.info(f"Téléchargement du modèle depuis {model_url}")
-                        response = requests.get(model_url, stream=True)
-                        if response.status_code == 200:
-                            with open(model_path, 'wb') as f:
-                                for chunk in response.iter_content(chunk_size=8192):
-                                    f.write(chunk)
-                            logger.info("Modèle téléchargé avec succès")
-                        else:
-                            logger.error(f"Échec du téléchargement du modèle: {response.status_code}")
+                        try:
+                            # Augmenter le timeout et désactiver la vérification SSL si nécessaire
+                            response = requests.get(model_url, stream=True, timeout=60, verify=True)
+                            if response.status_code == 200:
+                                # Télécharger par morceaux et suivre la progression
+                                total_size = int(response.headers.get('content-length', 0))
+                                logger.info(f"Taille du modèle à télécharger: {total_size / (1024*1024):.2f} Mo")
+                                
+                                with open(model_path, 'wb') as f:
+                                    downloaded = 0
+                                    for chunk in response.iter_content(chunk_size=1024*1024):  # 1MB chunks
+                                        if chunk:
+                                            f.write(chunk)
+                                            downloaded += len(chunk)
+                                            logger.info(f"Téléchargement: {downloaded / (1024*1024):.2f} Mo / {total_size / (1024*1024):.2f} Mo")
+                                
+                                # Vérifier la taille du fichier téléchargé
+                                actual_size = os.path.getsize(model_path)
+                                logger.info(f"Taille du fichier téléchargé: {actual_size / (1024*1024):.2f} Mo")
+                                
+                                # Vérifier que le fichier n'est pas trop petit
+                                if actual_size < model_min_size:
+                                    logger.error(f"Le fichier téléchargé est trop petit: {actual_size} octets")
+                                    raise ValueError(f"Le fichier modèle téléchargé est trop petit: {actual_size} octets vs {model_min_size} attendus")
+                                
+                                logger.info("Modèle téléchargé avec succès")
+                            else:
+                                logger.error(f"Échec du téléchargement du modèle: {response.status_code} - {response.text}")
+                        except Exception as e:
+                            logger.error(f"Erreur lors du téléchargement: {str(e)}")
+                            raise
                     else:
                         logger.warning("MODEL_URL non défini, impossible de télécharger le modèle")
                 
+                # Charger le modèle
                 if os.path.exists(model_path):
+                    file_size = os.path.getsize(model_path)
+                    logger.info(f"Chargement du modèle {model_path}, taille: {file_size / (1024*1024):.2f} Mo")
                     model = YOLO(model_path)
+                    logger.info(f"Modèle chargé avec succès!")
                 else:
                     raise FileNotFoundError(f"Le modèle {model_path} n'existe pas et n'a pas pu être téléchargé")
             except Exception as e:
@@ -279,6 +314,98 @@ async def stream_video(websocket: WebSocket):
 def signal_handler(sig, frame):
     logger.info(f"Signal {sig} reçu, arrêt du serveur...")
     os._exit(0)  # Sortie forcée mais propre
+
+@app.get("/check-model")
+async def check_model():
+    """
+    Route de diagnostic pour vérifier l'état du modèle et ses informations
+    """
+    model_path = "best.pt"
+    model_url = os.environ.get("MODEL_URL", "Non définie")
+    
+    # Masquer la partie sensible de l'URL
+    if len(model_url) > 20 and "http" in model_url:
+        displayed_url = model_url[:20] + "..." + model_url[-10:]
+    else:
+        displayed_url = model_url
+    
+    result = {
+        "status": "ok",
+        "model_path": model_path,
+        "model_exists": os.path.exists(model_path),
+        "model_url_configured": model_url != "Non définie",
+        "model_url_preview": displayed_url,
+        "datetime": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    
+    # Si le fichier existe, ajouter des informations sur sa taille
+    if os.path.exists(model_path):
+        size_bytes = os.path.getsize(model_path)
+        result["model_size_bytes"] = size_bytes
+        result["model_size_mb"] = round(size_bytes / (1024 * 1024), 2)
+        result["model_modified"] = time.ctime(os.path.getmtime(model_path))
+        
+        # Vérifier si le modèle semble valide
+        result["model_valid"] = size_bytes > 20 * 1024 * 1024  # >20MB
+        
+        try:
+            # Tenter de charger le modèle pour vérifier
+            model = get_model()
+            result["model_loaded"] = True
+            result["model_info"] = str(model.info())
+        except Exception as e:
+            result["model_loaded"] = False
+            result["load_error"] = str(e)
+    
+    return result
+
+@app.post("/upload-model")
+async def upload_model(file: UploadFile = File(...)):
+    """
+    Route pour télécharger directement le modèle sur le serveur
+    """
+    if not file.filename.endswith('.pt'):
+        raise HTTPException(status_code=400, detail="Le fichier doit avoir l'extension .pt")
+    
+    # Taille minimale attendue en bytes (20MB)
+    min_size = 20 * 1024 * 1024
+    model_path = "best.pt"
+    
+    # Lire le contenu du fichier en morceaux pour gérer les gros fichiers
+    content = b""
+    size = 0
+    try:
+        # Supprimer l'ancien modèle s'il existe
+        if os.path.exists(model_path):
+            os.remove(model_path)
+        
+        # Écrire le nouveau modèle
+        with open(model_path, "wb") as f:
+            while chunk := await file.read(1024 * 1024):  # Lire par morceaux de 1MB
+                size += len(chunk)
+                f.write(chunk)
+                
+        # Vérifier la taille
+        if size < min_size:
+            os.remove(model_path)
+            raise HTTPException(status_code=400, 
+                                detail=f"Le fichier est trop petit: {size} bytes. Minimum attendu: {min_size} bytes")
+        
+        # Réinitialiser le modèle pour qu'il soit rechargé
+        global model
+        with model_lock:
+            model = None
+        
+        return {"filename": file.filename, 
+                "size": size, 
+                "size_mb": round(size / (1024 * 1024), 2),
+                "status": "Modèle téléchargé avec succès"}
+    except Exception as e:
+        # En cas d'erreur, supprimer le fichier partiellement téléchargé
+        if os.path.exists(model_path):
+            os.remove(model_path)
+        logger.error(f"Erreur lors du téléchargement du modèle: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erreur pendant le téléchargement: {str(e)}")
 
 if __name__ == "__main__":
     # Récupérer le port depuis les variables d'environnement, avec une valeur par défaut
